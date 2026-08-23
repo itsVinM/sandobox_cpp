@@ -1,11 +1,11 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use redisops::store::Store;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use redisops::handler;
+use redisops::store::Store;
 
 fn bench_set_get(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let store = Store::new();
-    
+
     let mut group = c.benchmark_group("kv_store");
     for size in [1, 10, 100, 1000] {
         group.bench_with_input(BenchmarkId::new("set", size), &size, |b, &size| {
@@ -19,7 +19,7 @@ fn bench_set_get(c: &mut Criterion) {
                 });
             });
         });
-        
+
         group.bench_with_input(BenchmarkId::new("get", size), &size, |b, &size| {
             // Pre-populate
             rt.block_on(async {
@@ -44,7 +44,7 @@ fn bench_set_get(c: &mut Criterion) {
 
 fn bench_btree(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    
+
     let mut group = c.benchmark_group("btree");
     for size in [100, 1000, 10000] {
         group.bench_with_input(BenchmarkId::new("insert", size), &size, |b, &size| {
@@ -66,7 +66,7 @@ fn bench_btree(c: &mut Criterion) {
 fn bench_list(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let store = Store::new();
-    
+
     let mut group = c.benchmark_group("list");
     for size in [10, 100, 1000] {
         group.bench_with_input(BenchmarkId::new("lpush_rpop", size), &size, |b, &size| {
@@ -74,8 +74,13 @@ fn bench_list(c: &mut Criterion) {
                 rt.block_on(async {
                     for i in 0..size {
                         let val = format!("item:{}", i);
-                        handler::dispatch(store.clone(), vec!["LPUSH".into(), "bench:list".into(), val.clone()]).await;
-                        handler::dispatch(store.clone(), vec!["RPOP".into(), "bench:list".into()]).await;
+                        handler::dispatch(
+                            store.clone(),
+                            vec!["LPUSH".into(), "bench:list".into(), val.clone()],
+                        )
+                        .await;
+                        handler::dispatch(store.clone(), vec!["RPOP".into(), "bench:list".into()])
+                            .await;
                     }
                 });
             });
@@ -87,7 +92,7 @@ fn bench_list(c: &mut Criterion) {
 fn bench_concurrent(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let store = Store::new();
-    
+
     let mut group = c.benchmark_group("concurrent");
     group.bench_function("parallel_writes_100", |b| {
         b.iter(|| {

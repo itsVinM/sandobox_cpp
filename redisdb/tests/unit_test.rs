@@ -11,7 +11,12 @@ async fn test_handler_set_get() {
     let store = Store::new();
     let auth = Arc::new(RwLock::new(handler::AuthConfig::default()));
 
-    let resp = handler::dispatch(store.clone(), vec!["set".into(), "k".into(), "v".into()], auth.clone()).await;
+    let resp = handler::dispatch(
+        store.clone(),
+        vec!["set".into(), "k".into(), "v".into()],
+        auth.clone(),
+    )
+    .await;
     assert_eq!(resp[0], proto::SER_NIL);
 
     let resp = handler::dispatch(store.clone(), vec!["get".into(), "k".into()], auth.clone()).await;
@@ -26,7 +31,12 @@ async fn test_handler_del() {
     let store = Store::new();
     let auth = Arc::new(RwLock::new(handler::AuthConfig::default()));
 
-    handler::dispatch(store.clone(), vec!["set".into(), "k".into(), "v".into()], auth.clone()).await;
+    handler::dispatch(
+        store.clone(),
+        vec!["set".into(), "k".into(), "v".into()],
+        auth.clone(),
+    )
+    .await;
     let resp = handler::dispatch(store.clone(), vec!["del".into(), "k".into()], auth.clone()).await;
     assert_eq!(resp[0], proto::SER_INT);
     let n = i64::from_le_bytes(resp[1..9].try_into().unwrap());

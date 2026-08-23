@@ -2,8 +2,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <functional>
-#include <cstring>
+#include <utility>
 
 namespace test {
 
@@ -13,27 +12,41 @@ struct TestResult {
     std::string error;
 };
 
-static std::vector<TestResult>& results() {
+inline std::vector<TestResult>& results() {
     static std::vector<TestResult> r;
     return r;
 }
 
-static int& failures() {
-    static int f = 0;
-    return f;
+inline void record_failure(const std::string& msg) {
+    if (!results().empty())
+        results().back().error = msg;
 }
 
-#define TEST(name) \
-    static void test_##name(); \
-    static struct Reg_##name { \
-        Reg_##name() { test::results().push_back({#name, false, ""}); } \
-    } reg_##name; \
+struct TestCase {
+    std::string name;
+    void (*fn)();
+};
+
+inline std::vector<TestCase>& cases() {
+    static std::vector<TestCase> c;
+    return c;
+}
+
+struct Registrar {
+    Registrar(std::string name, void (*fn)()) {
+        cases().push_back({std::move(name), fn});
+    }
+};
+
+#define TEST(name)                                        \
+    static void test_##name();                            \
+    static ::test::Registrar reg_##name{#name, &test_##name}; \
     static void test_##name()
 
 #define ASSERT_TRUE(expr) \
     do { \
         if (!(expr)) { \
-            test::results().back().error = std::string("ASSERT_TRUE failed: ") + #expr + " at " + __FILE__ + ":" + std::to_string(__LINE__); \
+            test::record_failure(std::string("ASSERT_TRUE failed: ") + #expr + " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
             return; \
         } \
     } while(0)
@@ -43,7 +56,7 @@ static int& failures() {
 #define ASSERT_EQ(a, b) \
     do { \
         if ((a) != (b)) { \
-            test::results().back().error = std::string("ASSERT_EQ failed: ") + #a + " != " + #b + " at " + __FILE__ + ":" + std::to_string(__LINE__); \
+            test::record_failure(std::string("ASSERT_EQ failed: ") + #a + " != " + #b + " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
             return; \
         } \
     } while(0)
@@ -51,7 +64,7 @@ static int& failures() {
 #define ASSERT_NEQ(a, b) \
     do { \
         if ((a) == (b)) { \
-            test::results().back().error = std::string("ASSERT_NEQ failed: ") + #a + " == " + #b + " at " + __FILE__ + ":" + std::to_string(__LINE__); \
+            test::record_failure(std::string("ASSERT_NEQ failed: ") + #a + " == " + #b + " at " + __FILE__ + ":" + std::to_string(__LINE__)); \
             return; \
         } \
     } while(0)
@@ -59,20 +72,30 @@ static int& failures() {
 #define ASSERT_STREQ(a, b) \
     do { \
         if (std::string(a) != std::string(b)) { \
-            test::results().back().error = std::string("ASSERT_STREQ failed: \"") + (a) + "\" != \"" + (b) + "\" at " + __FILE__ + ":" + std::to_string(__LINE__); \
+            test::record_failure(std::string("ASSERT_STREQ failed: \"") + (a) + "\" != \"" + (b) + "\" at " + __FILE__ + ":" + std::to_string(__LINE__)); \
             return; \
         } \
     } while(0)
 
+#define ASSERT_LE(a, b) ASSERT_TRUE((a) <= (b))
+#define ASSERT_GT(a, b) ASSERT_TRUE((a) > (b))
+
 inline int run_all() {
-    int total = 0, passed = 0, failed = 0;
-    for (auto& t : results()) {
-        total++;
-        // Re-run the test function by looking it up
-        // We stored results but need to actually run
+    int failed = 0;
+    for (const auto& tc : cases()) {
+        results().push_back({tc.name, true, ""});
+        tc.fn();
+        auto& r = results().back();
+        r.passed = r.error.empty();
+        if (r.passed) {
+            std::cout << "  ok   " << r.name << "\n";
+        } else {
+            ++failed;
+            std::cout << "  FAIL " << r.name << ": " << r.error << "\n";
+        }
     }
-    // Actually we need to run the tests. Let's use a different approach.
-    return failed;
+    std::cout << results().size() << " tests, " << failed << " failures\n";
+    return failed == 0 ? 0 : 1;
 }
 
 } // namespace test

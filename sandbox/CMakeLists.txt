@@ -31,3 +31,14 @@ if(APPLE)
 else()
     target_link_libraries(sandbox PRIVATE pthread rt seccomp)
 endif()
+
+enable_testing()
+
+add_executable(sandbox_tests
+    tests/test_main.cpp
+    src/metrics.cpp
+    src/log_aggregator.cpp)
+
+target_include_directories(sandbox_tests PRIVATE include tests)
+
+add_test(NAME sandbox_unit_tests COMMAND sandbox_tests)

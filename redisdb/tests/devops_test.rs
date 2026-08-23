@@ -30,7 +30,12 @@ async fn test_job_submit_and_status() {
     assert_eq!(id, "job-001");
 
     // Check status
-    let resp = handler::dispatch(store.clone(), vec!["job status".into(), "job-001".into()], auth.clone()).await;
+    let resp = handler::dispatch(
+        store.clone(),
+        vec!["job status".into(), "job-001".into()],
+        auth.clone(),
+    )
+    .await;
     assert_eq!(resp[0], proto::SER_STR);
     let len = u32::from_le_bytes(resp[1..5].try_into().unwrap()) as usize;
     let status = String::from_utf8(resp[5..5 + len].to_vec()).unwrap();
@@ -200,7 +205,12 @@ async fn test_bitfield_ops() {
         auth.clone(),
     )
     .await;
-    let resp = handler::dispatch(store.clone(), vec!["bitcount".into(), "flags".into()], auth.clone()).await;
+    let resp = handler::dispatch(
+        store.clone(),
+        vec!["bitcount".into(), "flags".into()],
+        auth.clone(),
+    )
+    .await;
     let n = i64::from_le_bytes(resp[1..9].try_into().unwrap());
     assert_eq!(n, 2);
 
@@ -227,23 +237,40 @@ async fn test_list_ops() {
     let auth = Arc::new(RwLock::new(handler::AuthConfig::default()));
 
     // Push items
-    handler::dispatch(store.clone(), vec!["lpush".into(), "q".into(), "a".into()], auth.clone()).await;
-    handler::dispatch(store.clone(), vec!["lpush".into(), "q".into(), "b".into()], auth.clone()).await;
+    handler::dispatch(
+        store.clone(),
+        vec!["lpush".into(), "q".into(), "a".into()],
+        auth.clone(),
+    )
+    .await;
+    handler::dispatch(
+        store.clone(),
+        vec!["lpush".into(), "q".into(), "b".into()],
+        auth.clone(),
+    )
+    .await;
 
     // Length
-    let resp = handler::dispatch(store.clone(), vec!["llen".into(), "q".into()], auth.clone()).await;
+    let resp =
+        handler::dispatch(store.clone(), vec!["llen".into(), "q".into()], auth.clone()).await;
     let n = i64::from_le_bytes(resp[1..9].try_into().unwrap());
     assert_eq!(n, 2);
 
     // Pop from left (should be "b" since lpush inserts at front)
-    let resp = handler::dispatch(store.clone(), vec!["lpop".into(), "q".into()], auth.clone()).await;
+    let resp =
+        handler::dispatch(store.clone(), vec!["lpop".into(), "q".into()], auth.clone()).await;
     assert_eq!(resp[0], proto::SER_STR);
     let len = u32::from_le_bytes(resp[1..5].try_into().unwrap()) as usize;
     let val = String::from_utf8(resp[5..5 + len].to_vec()).unwrap();
     assert_eq!(val, "b");
 
     // Range
-    handler::dispatch(store.clone(), vec!["lpush".into(), "q".into(), "c".into()], auth.clone()).await;
+    handler::dispatch(
+        store.clone(),
+        vec!["lpush".into(), "q".into(), "c".into()],
+        auth.clone(),
+    )
+    .await;
     let resp = handler::dispatch(
         store.clone(),
         vec!["lrange".into(), "q".into(), "0".into(), "-1".into()],
