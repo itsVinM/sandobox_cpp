@@ -10,15 +10,16 @@
 #include <devops/snapshot.hpp>
 #include <devops/ipc.hpp>
 #include <devops/security.hpp>
+#include <charconv>
 #include <format>
 #include <iostream>
-#include <string>
+#include <string_view>
 #include <thread>
 #include <chrono>
 #include <cstring>
-#include <cstdlib>
 #include <signal.h>
 #include <getopt.h>
+#include <unistd.h>
 #ifdef __APPLE__
 #include <sys/event.h>
 #define IN_CREATE 0
@@ -27,10 +28,10 @@
 #include <sys/inotify.h>
 #endif
 
-static volatile bool g_running = true;
+static volatile sig_atomic_t g_running = 1;
 
 static void signal_handler(int) {
-    g_running = false;
+    g_running = 0;
 }
 
 static void print_usage(const char* prog) {
@@ -51,10 +52,11 @@ static void print_usage(const char* prog) {
         prog);
 }
 
-int main(int argc, char* argv[]) {
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+// ── Configuration ──
+// Parsed into one struct up front so main() reads linearly afterwards and
+// numeric flags can never throw (from_chars instead of std::stoi).
 
+struct Options {
     std::string host = "127.0.0.1";
     uint16_t port = 1234;
     std::string sandbox_id = "cpp-sandbox-1";
@@ -66,6 +68,22 @@ int main(int argc, char* argv[]) {
     bool enable_netns = false;
     bool enable_ipc = false;
     uint32_t max_restarts = 3;
+    bool help = false;
+};
+
+template <class T>
+static devops::Result<T> parse_num(std::string_view raw) {
+    T value{};
+    auto [end, ec] = std::from_chars(raw.begin(), raw.end(), value);
+    if (ec != std::errc{} || end != raw.end()) {
+        return devops::Error{devops::Errc::config,
+                             std::format("invalid number '{}'", raw)};
+    }
+    return value;
+}
+
+static devops::Result<Options> parse_args(int argc, char* argv[]) {
+    Options o;
 
     static struct option long_opts[] = {
         {"host",          required_argument, nullptr, 'h'},
@@ -86,25 +104,70 @@ int main(int argc, char* argv[]) {
     int opt;
     while ((opt = getopt_long(argc, argv, "h:p:i:t:m:w:ns:NIr:H", long_opts, nullptr)) != -1) {
         switch (opt) {
-            case 'h': host = optarg; break;
-            case 'p': port = std::stoi(optarg); break;
-            case 'i': sandbox_id = optarg; break;
-            case 't': target_type = optarg; break;
-            case 'm': metrics_port = std::stoi(optarg); break;
-            case 'w': watch_path = optarg; break;
-            case 'n': use_seccomp = false; break;
-            case 's': security_profile = optarg; break;
-            case 'N': enable_netns = true; break;
-            case 'I': enable_ipc = true; break;
-            case 'r': max_restarts = std::stoi(optarg); break;
-            case 'H': print_usage(argv[0]); return 0;
-            default:  print_usage(argv[0]); return 1;
+            case 'h': o.host = optarg; break;
+            case 'i': o.sandbox_id = optarg; break;
+            case 't': o.target_type = optarg; break;
+            case 'w': o.watch_path = optarg; break;
+            case 's': o.security_profile = optarg; break;
+            case 'n': o.use_seccomp = false; break;
+            case 'N': o.enable_netns = true; break;
+            case 'I': o.enable_ipc = true; break;
+            case 'H': o.help = true; return o;
+            default:  return devops::Error{devops::Errc::config, "bad flag"};
+            case 'p': {
+                auto v = parse_num<uint64_t>(optarg);
+                if (!v || *v > 65535)
+                    return devops::Error{devops::Errc::config,
+                                         std::format("invalid --port '{}'", optarg)};
+                o.port = static_cast<uint16_t>(*v);
+                break;
+            }
+            case 'm': {
+                auto v = parse_num<uint64_t>(optarg);
+                if (!v || *v > 65535)
+                    return devops::Error{devops::Errc::config,
+                                         std::format("invalid --metrics-port '{}'", optarg)};
+                o.metrics_port = static_cast<uint16_t>(*v);
+                break;
+            }
+            case 'r': {
+                auto v = parse_num<uint32_t>(optarg);
+                if (!v)
+                    return devops::Error{devops::Errc::config,
+                                         std::format("invalid --max-restarts '{}'", optarg)};
+                o.max_restarts = *v;
+                break;
+            }
         }
     }
+    return o;
+}
 
-    if (sandbox_id.empty()) {
-        sandbox_id = "cpp-sandbox-" + std::to_string(getpid());
+int main(int argc, char* argv[]) {
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    auto parsed = parse_args(argc, argv);
+    if (!parsed) {
+        print_usage(argv[0]);
+        std::cerr << std::format("[sandbox] {}\n", parsed.error().message);
+        return 1;
     }
+
+    // Field order matches Options exactly — structured bindings must name
+    // every member, so `help` is bound too and consumed right below.
+    auto [host, port, sandbox_id_default, target_type, metrics_port, watch_path,
+          use_seccomp, security_profile, enable_netns, enable_ipc, max_restarts,
+          help_requested] = *parsed;
+
+    if (help_requested) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    std::string sandbox_id = sandbox_id_default.empty()
+                                 ? std::format("cpp-sandbox-{}", ::getpid())
+                                 : sandbox_id_default;
 
     std::cout << std::format(
         "[sandbox] id={} type={} host={}:{} metrics={} seccomp={} profile={} netns={} ipc={}\n",
@@ -224,8 +287,9 @@ int main(int argc, char* argv[]) {
     // ── Connect to Redis ──
 
     devops::RedisClient redis;
-    if (!redis.connect(host, port)) {
-        std::cerr << std::format("[sandbox] failed to connect to {}:{}\n", host, port);
+    if (auto conn = redis.connect(host, port); conn.is_err()) {
+        std::cerr << std::format("[sandbox] failed to connect to {}:{}: {}\n",
+                                 host, port, conn.error().message);
         return 1;
     }
     std::cout << "[sandbox] connected to Redis\n";
@@ -271,7 +335,7 @@ int main(int argc, char* argv[]) {
         log_agg.push("scheduler", "info", std::format("running job: {} ({})", job_id, job_name));
         metrics.counter("sandbox.jobs_started_total", 1, {{"target", target}});
 
-        redis.sandbox_claim(sandbox_id, job_id);
+        (void)redis.sandbox_claim(sandbox_id, job_id);
 
         // Validate command against security profile
         auto validation = security_manager.validate_command(command, security_profile);
@@ -280,9 +344,9 @@ int main(int argc, char* argv[]) {
             for (const auto& v : validation.violations) {
                 std::cerr << std::format("  - {}\n", v);
             }
-            redis.job_log(job_id, "SECURITY: command blocked by policy");
-            redis.job_result(job_id, 126, 0);
-            redis.sandbox_release(sandbox_id);
+            (void)redis.job_log(job_id, "SECURITY: command blocked by policy");
+            (void)redis.job_result(job_id, 126, 0);
+            (void)redis.sandbox_release(sandbox_id);
             continue;
         }
 
@@ -291,7 +355,7 @@ int main(int argc, char* argv[]) {
         if (enable_netns && net_manager) {
             netns = net_manager->create_namespace(job_id);
             if (netns) {
-                redis.job_log(job_id, "sandbox: network namespace created");
+                (void)redis.job_log(job_id, "sandbox: network namespace created");
             }
         }
 
@@ -300,21 +364,21 @@ int main(int argc, char* argv[]) {
         cfg.enable_seccomp = use_seccomp;
         cfg.enable_network = (target == "network" || enable_netns);
 
-        redis.job_log(job_id, "sandbox: starting execution");
+        (void)redis.job_log(job_id, "sandbox: starting execution");
 
         auto start = std::chrono::steady_clock::now();
 
         devops::Sandbox sandbox(cfg);
         auto result = sandbox.run(command, {}, [&](const std::string& line) {
             std::string truncated = line.substr(0, 1000);
-            redis.job_log(job_id, truncated);
+            (void)redis.job_log(job_id, truncated);
             log_agg.push_raw("sandbox:" + job_id, line);
         });
 
         auto end = std::chrono::steady_clock::now();
         int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-        redis.job_result(job_id, result.exit_code, duration_ms);
+        (void)redis.job_result(job_id, result.exit_code, duration_ms);
         metrics.counter("sandbox.jobs_completed_total", 1,
                        {{"target", target}, {"exit_code", std::to_string(result.exit_code)}});
         metrics.histogram("sandbox.execution_duration_ms", static_cast<double>(duration_ms));
@@ -335,7 +399,7 @@ int main(int argc, char* argv[]) {
             net_manager->remove_namespace(job_id);
         }
 
-        redis.sandbox_release(sandbox_id);
+        (void)redis.sandbox_release(sandbox_id);
 
         std::string status = (result.exit_code == 0) ? "PASSED" : "FAILED";
         std::cout << std::format("[sandbox] job {} {} (exit={}, {}ms)\n",

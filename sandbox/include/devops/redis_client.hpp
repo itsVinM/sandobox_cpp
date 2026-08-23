@@ -1,9 +1,12 @@
 #pragma once
 #include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
-#include <optional>
-#include <memory>
+
+#include <devops/result.hpp>
 
 namespace devops {
 
@@ -16,6 +19,8 @@ enum class ResponseTag : uint8_t {
     Arr   = 5,
 };
 
+/// One decoded server response. Tagged union by hand so it stays POD-ish and
+/// matches the wire format exactly.
 struct Response {
     ResponseTag tag;
     int32_t err_code = 0;
@@ -34,42 +39,52 @@ struct Response {
     const std::vector<Response>& as_arr() const { return arr; }
 };
 
+/// Blocking client for the redis-rs binary protocol.
+/// Non-copyable (owns a socket), movable; closes on destruction.
 class RedisClient {
 public:
-    RedisClient();
+    RedisClient() = default;
     ~RedisClient();
 
-    bool connect(const std::string& host, uint16_t port);
+    RedisClient(const RedisClient&) = delete;
+    RedisClient& operator=(const RedisClient&) = delete;
+    RedisClient(RedisClient&& other) noexcept;
+    RedisClient& operator=(RedisClient&& other) noexcept;
+
+    Result<void> connect(std::string_view host, uint16_t port);
     void close();
     bool is_connected() const;
 
-    std::optional<Response> send(const std::vector<std::string>& args);
+    /// One request/response round trip. Fails on socket or framing errors —
+    /// application-level Error responses are returned as Ok(Response) with
+    /// tag == Error, mirroring the rust handler's contract.
+    Result<Response> send(std::vector<std::string> args);
 
-    // Convenience methods
-    std::optional<Response> set(const std::string& key, const std::string& val);
-    std::optional<Response> get(const std::string& key);
-    std::optional<Response> del(const std::string& key);
-    std::optional<Response> lpush(const std::string& key, const std::string& val);
-    std::optional<Response> rpop(const std::string& key);
-    std::optional<Response> lrange(const std::string& key, int64_t start, int64_t stop);
-    std::optional<Response> llen(const std::string& key);
+    // Convenience wrappers
+    Result<Response> set(std::string_view key, std::string_view val);
+    Result<Response> get(std::string_view key);
+    Result<Response> del(std::string_view key);
+    Result<Response> lpush(std::string_view key, std::string_view val);
+    Result<Response> rpop(std::string_view key);
+    Result<Response> lrange(std::string_view key, int64_t start, int64_t stop);
+    Result<Response> llen(std::string_view key);
 
     // DevOps commands
-    std::optional<Response> job_next();
-    std::optional<Response> job_status(const std::string& id);
-    std::optional<Response> job_result(const std::string& id, int exit_code, int64_t duration_ms);
-    std::optional<Response> job_log(const std::string& id, const std::string& line);
-    std::optional<Response> sandbox_register(const std::string& id, const std::string& type, const std::string& addr);
-    std::optional<Response> sandbox_claim(const std::string& id, const std::string& job_id);
-    std::optional<Response> sandbox_release(const std::string& id);
-    std::optional<Response> metric_record(const std::string& name, double value);
-    std::optional<Response> metric_summary();
+    Result<Response> job_next();
+    Result<Response> job_status(std::string_view id);
+    Result<Response> job_result(std::string_view id, int exit_code, int64_t duration_ms);
+    Result<Response> job_log(std::string_view id, std::string_view line);
+    Result<Response> sandbox_register(std::string_view id, std::string_view type,
+                                      std::string_view addr);
+    Result<Response> sandbox_claim(std::string_view id, std::string_view job_id);
+    Result<Response> sandbox_release(std::string_view id);
+    Result<Response> metric_record(std::string_view name, double value);
+    Result<Response> metric_summary();
 
 private:
-    bool write_all(const uint8_t* data, size_t len);
-    bool read_exact(uint8_t* buf, size_t len);
-    std::optional<Response> read_response();
-    std::optional<Response> read_value();
+    Result<void> write_all(const uint8_t* data, size_t len);
+    Result<void> read_exact(uint8_t* buf, size_t len);
+    Result<Response> read_frame();
 
     int fd_ = -1;
 };

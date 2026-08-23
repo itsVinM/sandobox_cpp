@@ -7,8 +7,6 @@ edition = "2021"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ratatui = "0.29"
-crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-recursion = "1"
@@ -26,10 +24,6 @@ lto = true
 [[bin]]
 name = "redisops"
 path = "src/main.rs"
-
-[[bin]]
-name = "redisops-tui"
-path = "src/bin/redis-tui.rs"
 
 [dev-dependencies]
 rand = "0.8"

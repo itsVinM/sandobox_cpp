@@ -1,105 +1,131 @@
+use std::collections::{BTreeMap, HashMap};
+
+/// Total order over f64 (scores are never NaN — `add` rejects them, so a
+/// manual `Eq` is sound even though f64 alone isn't).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Score(f64);
+
+impl Eq for Score {}
+
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
     pub score: f64,
 }
 
-fn less(a: &Entry, b: &Entry) -> bool {
-    if a.score != b.score {
-        return a.score < b.score;
-    }
-    a.name < b.name
+/// Sorted-set: O(log n) add/remove via one BTreeMap ordered by (score, name),
+/// plus a HashMap for O(1) score lookups by member name.
+pub struct ZSet {
+    scores: HashMap<String, f64>,
+    ranked: BTreeMap<(Score, String), ()>,
 }
 
-pub struct ZSet {
-    by_name: std::collections::HashMap<String, f64>,
-    sorted: Vec<Entry>,
+impl Default for ZSet {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ZSet {
     pub fn new() -> Self {
         ZSet {
-            by_name: std::collections::HashMap::new(),
-            sorted: Vec::new(),
+            scores: HashMap::new(),
+            ranked: BTreeMap::new(),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.sorted.len()
+        self.scores.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.scores.is_empty()
+    }
+
+    /// Returns true if the member's score was inserted or changed.
     pub fn add(&mut self, name: String, score: f64) -> bool {
-        if let Some(&old) = self.by_name.get(&name) {
-            if (old - score).abs() < f64::EPSILON {
+        if score.is_nan() {
+            return false;
+        }
+        if let Some(&old) = self.scores.get(&name) {
+            if old == score {
                 return false;
             }
-            self.remove(&name);
+            self.ranked.remove(&(Score(old), name.clone()));
         }
-        self.by_name.insert(name.clone(), score);
-        let e = Entry { name, score };
-        let i = match self.sorted.binary_search_by(|probe| {
-            if less(probe, &e) {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            }
-        }) {
-            Ok(i) | Err(i) => i,
-        };
-        self.sorted.insert(i, e);
+        self.scores.insert(name.clone(), score);
+        self.ranked.insert((Score(score), name), ());
         true
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
-        if let Some(&score) = self.by_name.get(name) {
-            self.by_name.remove(name);
-            let key = Entry {
-                name: name.to_string(),
-                score,
-            };
-            if let Ok(i) = self.sorted.binary_search_by(|probe| {
-                if less(probe, &key) {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Greater
-                }
-            }) {
-                if i < self.sorted.len() && self.sorted[i].name == name {
-                    self.sorted.remove(i);
-                }
-            }
-            true
-        } else {
-            false
+        match self.scores.remove(name) {
+            Some(score) => self
+                .ranked
+                .remove(&(Score(score), name.to_string()))
+                .is_some(),
+            None => false,
         }
     }
 
     pub fn score(&self, name: &str) -> Option<f64> {
-        self.by_name.get(name).copied()
+        self.scores.get(name).copied()
     }
 
+    /// Entries with (score, name) >= (min_score, min_name), skipping `offset`,
+    /// returning at most `limit`.
     pub fn query(&self, min_score: f64, min_name: &str, offset: i64, limit: i64) -> Vec<Entry> {
         if limit <= 0 {
             return Vec::new();
         }
-        let key = Entry {
-            name: min_name.to_string(),
-            score: min_score,
+        let start_key = (Score(min_score), min_name.to_string());
+        let to_entry = |(s, n): &(Score, String)| Entry {
+            name: n.clone(),
+            score: s.0,
         };
-        let pos = match self.sorted.binary_search_by(|probe| {
-            if less(probe, &key) {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
+
+        let out = if offset >= 0 {
+            self.ranked
+                .range(start_key..)
+                .skip(offset as usize)
+                .take(limit as usize)
+                .map(|(k, _)| to_entry(k))
+                .collect::<Vec<_>>()
+        } else {
+            // Window reaches back before the start key: take the closest
+            // elements from below it (reversed range, O(|offset|)) and top up
+            // from the forward range.
+            let mut out: Vec<Entry> = self
+                .ranked
+                .range(..&start_key)
+                .rev()
+                .take((-offset) as usize)
+                .take(limit as usize)
+                .map(|(k, _)| to_entry(k))
+                .collect();
+            out.reverse();
+            if out.len() < limit as usize {
+                out.extend(
+                    self.ranked
+                        .range(&start_key..)
+                        .take(limit as usize - out.len())
+                        .map(|(k, _)| to_entry(k)),
+                );
             }
-        }) {
-            Ok(i) | Err(i) => i,
+            out
         };
-        let pos = pos.saturating_add_signed(offset as isize).max(0);
-        let end = (pos + limit as usize).min(self.sorted.len());
-        if pos >= end {
-            return Vec::new();
-        }
-        self.sorted[pos..end].to_vec()
+        out
     }
 }

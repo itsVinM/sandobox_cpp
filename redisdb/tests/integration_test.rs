@@ -187,10 +187,10 @@ async fn test_zscore() {
     let addr = start_server().await;
     let mut c = TestClient::connect(&addr).await;
 
-    c.must_send_recv(3, &["zadd", "z", "3.14", "pi"]).await;
+    c.must_send_recv(3, &["zadd", "z", "3.25", "pi"]).await;
     let raw = c.must_send_recv(4, &["zscore", "z", "pi"]).await;
     let got = decode_dbl(&raw);
-    assert!((got - 3.14).abs() < 1e-9, "zscore got {} want 3.14", got);
+    assert!((got - 3.25).abs() < 1e-9, "zscore got {} want 3.25", got);
 }
 
 #[tokio::test]

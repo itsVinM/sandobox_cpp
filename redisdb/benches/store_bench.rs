@@ -1,60 +1,51 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use redisops::handler;
+use redisops::handler::{self, AuthConfig};
 use redisops::store::Store;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+async fn d(store: Store, args: Vec<&str>) {
+    let args: Vec<String> = args.into_iter().map(String::from).collect();
+    let _ = handler::dispatch(store, args, Arc::new(RwLock::new(AuthConfig::default()))).await;
+}
 
 fn bench_set_get(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let runtime = rt();
     let store = Store::new();
 
     let mut group = c.benchmark_group("kv_store");
     for size in [1, 10, 100, 1000] {
         group.bench_with_input(BenchmarkId::new("set", size), &size, |b, &size| {
             b.iter(|| {
-                rt.block_on(async {
+                runtime.block_on(async {
                     for i in 0..size {
-                        let key = format!("key:{}", i);
-                        let val = format!("value:{}", i);
-                        handler::dispatch(store.clone(), vec!["SET".into(), key, val]).await;
+                        d(
+                            store.clone(),
+                            vec!["SET", &format!("key:{i}"), &format!("value:{i}")],
+                        )
+                        .await;
                     }
                 });
             });
         });
 
         group.bench_with_input(BenchmarkId::new("get", size), &size, |b, &size| {
-            // Pre-populate
-            rt.block_on(async {
+            runtime.block_on(async {
                 for i in 0..size {
-                    let key = format!("key:{}", i);
-                    let val = format!("value:{}", i);
-                    handler::dispatch(store.clone(), vec!["SET".into(), key, val]).await;
+                    d(store.clone(), vec!["SET", &format!("key:{i}"), "value"]).await;
                 }
             });
             b.iter(|| {
-                rt.block_on(async {
+                runtime.block_on(async {
                     for i in 0..size {
-                        let key = format!("key:{}", i);
-                        handler::dispatch(store.clone(), vec!["GET".into(), key]).await;
-                    }
-                });
-            });
-        });
-    }
-    group.finish();
-}
-
-fn bench_btree(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    let mut group = c.benchmark_group("btree");
-    for size in [100, 1000, 10000] {
-        group.bench_with_input(BenchmarkId::new("insert", size), &size, |b, &size| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let store = Store::new();
-                    for i in 0..size {
-                        let key = format!("btree:{}", i);
-                        let val = format!("val:{}", i);
-                        handler::dispatch(store.clone(), vec!["SET".into(), key, val]).await;
+                        d(store.clone(), vec!["GET", &format!("key:{i}")]).await;
                     }
                 });
             });
@@ -64,23 +55,21 @@ fn bench_btree(c: &mut Criterion) {
 }
 
 fn bench_list(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let runtime = rt();
     let store = Store::new();
 
     let mut group = c.benchmark_group("list");
     for size in [10, 100, 1000] {
         group.bench_with_input(BenchmarkId::new("lpush_rpop", size), &size, |b, &size| {
             b.iter(|| {
-                rt.block_on(async {
+                runtime.block_on(async {
                     for i in 0..size {
-                        let val = format!("item:{}", i);
-                        handler::dispatch(
+                        d(
                             store.clone(),
-                            vec!["LPUSH".into(), "bench:list".into(), val.clone()],
+                            vec!["LPUSH", "bench:list", &format!("item:{i}")],
                         )
                         .await;
-                        handler::dispatch(store.clone(), vec!["RPOP".into(), "bench:list".into()])
-                            .await;
+                        d(store.clone(), vec!["RPOP", "bench:list"]).await;
                     }
                 });
             });
@@ -90,20 +79,18 @@ fn bench_list(c: &mut Criterion) {
 }
 
 fn bench_concurrent(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let runtime = rt();
     let store = Store::new();
 
     let mut group = c.benchmark_group("concurrent");
     group.bench_function("parallel_writes_100", |b| {
         b.iter(|| {
-            rt.block_on(async {
+            runtime.block_on(async {
                 let mut handles = vec![];
                 for i in 0..100 {
                     let s = store.clone();
                     handles.push(tokio::spawn(async move {
-                        let key = format!("conc:{}", i);
-                        let val = format!("val:{}", i);
-                        handler::dispatch(s, vec!["SET".into(), key, val]).await;
+                        d(s, vec!["SET", &format!("conc:{i}"), "v"]).await;
                     }));
                 }
                 for h in handles {
@@ -115,11 +102,5 @@ fn bench_concurrent(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_set_get,
-    bench_btree,
-    bench_list,
-    bench_concurrent
-);
+criterion_group!(benches, bench_set_get, bench_list, bench_concurrent);
 criterion_main!(benches);

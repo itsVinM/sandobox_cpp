@@ -147,8 +147,7 @@ async fn handle_conn(
             }
         };
 
-        let cmd_name = args.first().cloned().unwrap_or_default();
-        stats.inc_cmd(cmd_name);
+        stats.bump();
 
         let resp = handler::dispatch(store.clone(), args, auth.clone()).await;
         proto::write_response(&mut stream, &resp).await?;

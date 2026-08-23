@@ -54,7 +54,7 @@ async fn test_handler_zadd_zscore() {
 
     let resp = handler::dispatch(
         store.clone(),
-        vec!["zadd".into(), "z".into(), "3.14".into(), "pi".into()],
+        vec!["zadd".into(), "z".into(), "3.25".into(), "pi".into()],
         auth.clone(),
     )
     .await;
@@ -70,7 +70,7 @@ async fn test_handler_zadd_zscore() {
     .await;
     assert_eq!(resp[0], proto::SER_DBL);
     let val = f64::from_le_bytes(resp[1..9].try_into().unwrap());
-    assert!((val - 3.14).abs() < 1e-9);
+    assert!((val - 3.25).abs() < 1e-9);
 }
 
 #[tokio::test]

@@ -320,48 +320,48 @@ cmd_submit() {
     local job_id="job-$(date +%s)-$$"
 
     log "Submitting job: $name (target=$target)"
-    redis_cmd "job" "submit" "$job_id" "$name" "$target" "$cmd"
+    redis_cmd "job submit" "$job_id" "$name" "$target" "$cmd"
     ok "Job submitted: $job_id"
     echo "$job_id"
 }
 
 cmd_next() {
     log "Fetching next job..."
-    redis_cmd "job" "next"
+    redis_cmd "job next"
 }
 
 cmd_result() {
     local job_id="${1:?usage: devops.sh result <job_id> <exit_code> <duration_ms>}"
     local exit_code="${2:?missing exit_code}"
     local duration="${3:?missing duration_ms}"
-    redis_cmd "job" "result" "$job_id" "$exit_code" "$duration"
+    redis_cmd "job result" "$job_id" "$exit_code" "$duration"
 }
 
 cmd_list() {
     local filter="${1:-}"
     if [ -n "$filter" ]; then
-        redis_cmd "job" "list" "$filter"
+        redis_cmd "job list" "$filter"
     else
-        redis_cmd "job" "list"
+        redis_cmd "job list"
     fi
 }
 
 cmd_job_status() {
     local job_id="${1:?usage: devops.sh job-status <job_id>}"
-    redis_cmd "job" "status" "$job_id"
+    redis_cmd "job status" "$job_id"
 }
 
 cmd_job_log() {
     local job_id="${1:?usage: devops.sh job-log <job_id>}"
-    redis_cmd "job" "log" "$job_id"
+    redis_cmd "job log" "$job_id"
 }
 
 cmd_metric_summary() {
-    redis_cmd "metric" "summary"
+    redis_cmd "metric summary"
 }
 
 cmd_sandbox_status() {
-    redis_cmd "sandbox" "status"
+    redis_cmd "sandbox status"
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -442,7 +442,7 @@ cmd_demo() {
     log "Processing jobs..."
     for i in 1 2 3; do
         local job
-        job=$(redis_cmd "job" "next")
+        job=$(redis_cmd "job next")
         if [ "$job" = "nil" ] || [ -z "$job" ]; then
             warn "No more jobs in queue"
             break
@@ -450,7 +450,7 @@ cmd_demo() {
         log "Got job: $job"
         # Simulate execution
         sleep 0.2
-        redis_cmd "job" "result" "$(echo "$job" | head -1)" "0" "200"
+        redis_cmd "job result" "$(echo "$job" | head -1)" "0" "200"
         ok "Job completed"
     done
     echo ""

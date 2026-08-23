@@ -1,245 +1,302 @@
 #include <devops/redis_client.hpp>
+
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
 #include <cstring>
 #include <format>
-#include <iostream>
+#include <utility>
 
 namespace devops {
+namespace {
 
-RedisClient::RedisClient() = default;
+constexpr uint32_t MAX_FRAME = 64 * 1024 * 1024;
+
+// Wire integers are little-endian u32/u64; both peers run on LE hosts and the
+// format is fixed, so plain loads are fine here.
+template <class T>
+T load_le(const uint8_t* p) {
+    T v;
+    std::memcpy(&v, p, sizeof(T));
+    return v;
+}
+
+void put_le(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
+
+Result<Response> parse_value(std::string_view buf, size_t& pos);
+
+} // namespace
 
 RedisClient::~RedisClient() { close(); }
 
-bool RedisClient::connect(const std::string& host, uint16_t port) {
-    fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd_ < 0) return false;
+RedisClient::RedisClient(RedisClient&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+
+RedisClient& RedisClient::operator=(RedisClient&& other) noexcept {
+    if (this != &other) {
+        close();
+        fd_ = std::exchange(other.fd_, -1);
+    }
+    return *this;
+}
+
+Result<void> RedisClient::connect(std::string_view host, uint16_t port) {
+    close();
+
+    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd_ < 0) {
+        return Error::system("socket");
+    }
 
     int flag = 1;
-    setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+    if (::inet_pton(AF_INET, std::string(host).c_str(), &addr.sin_addr) != 1) {
+        int saved = EINVAL; // inet_pton does not set errno reliably
+        close();
+        errno = saved;
+        return Error::system(std::format("invalid host '{}'", host));
+    }
 
     if (::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        close();
-        return false;
+        return Error::system(std::format("connect {}:{}", host, port));
     }
-    return true;
+    return {};
 }
 
 void RedisClient::close() {
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
 }
 
 bool RedisClient::is_connected() const { return fd_ >= 0; }
 
-bool RedisClient::write_all(const uint8_t* data, size_t len) {
+Result<void> RedisClient::write_all(const uint8_t* data, size_t len) {
     size_t sent = 0;
     while (sent < len) {
         ssize_t n = ::send(fd_, data + sent, len - sent, 0);
-        if (n <= 0) return false;
-        sent += n;
+        if (n <= 0) {
+            return Error::system("send");
+        }
+        sent += static_cast<size_t>(n);
     }
-    return true;
+    return {};
 }
 
-bool RedisClient::read_exact(uint8_t* buf, size_t len) {
+Result<void> RedisClient::read_exact(uint8_t* buf, size_t len) {
     size_t got = 0;
     while (got < len) {
         ssize_t n = ::recv(fd_, buf + got, len - got, 0);
-        if (n <= 0) return false;
-        got += n;
-    }
-    return true;
-}
-
-std::optional<Response> RedisClient::send(const std::vector<std::string>& args) {
-    // Encode: [u32 msg_len][u32 n_args][u32 arg_len][arg_bytes]...
-    uint32_t payload_size = 4; // n_args
-    for (const auto& arg : args) {
-        payload_size += 4 + arg.size();
-    }
-
-    // Message = [u32 msg_len][payload]
-    std::vector<uint8_t> msg(4 + payload_size);
-    uint32_t msg_len = payload_size;
-    std::memcpy(msg.data(), &msg_len, 4);
-    uint32_t n = args.size();
-    std::memcpy(msg.data() + 4, &n, 4);
-
-    size_t offset = 8;
-    for (const auto& arg : args) {
-        uint32_t len = arg.size();
-        std::memcpy(msg.data() + offset, &len, 4);
-        std::memcpy(msg.data() + offset + 4, arg.data(), arg.size());
-        offset += 4 + arg.size();
-    }
-
-    if (!write_all(msg.data(), msg.size())) return std::nullopt;
-    return read_response();
-}
-
-// Helper to parse from buffer (forward declaration)
-static std::optional<Response> read_value_from(const std::vector<uint8_t>& buf, size_t& pos);
-
-std::optional<Response> RedisClient::read_response() {
-    uint32_t len;
-    if (!read_exact(reinterpret_cast<uint8_t*>(&len), 4)) return std::nullopt;
-    if (len > 64 * 1024 * 1024) return std::nullopt;
-
-    std::vector<uint8_t> buf(len);
-    if (!read_exact(buf.data(), len)) return std::nullopt;
-
-    // Parse value from buffer
-    size_t pos = 0;
-    return read_value_from(buf, pos);
-}
-
-// Helper to parse from buffer
-static std::optional<Response> read_value_from(const std::vector<uint8_t>& buf, size_t& pos) {
-    if (pos >= buf.size()) return std::nullopt;
-
-    Response resp;
-    resp.tag = static_cast<ResponseTag>(buf[pos++]);
-
-    switch (resp.tag) {
-        case ResponseTag::Nil:
-            return resp;
-
-        case ResponseTag::Error: {
-            if (pos + 8 > buf.size()) return std::nullopt;
-            std::memcpy(&resp.err_code, buf.data() + pos, 4);
-            pos += 4;
-            uint32_t msg_len;
-            std::memcpy(&msg_len, buf.data() + pos, 4);
-            pos += 4;
-            if (pos + msg_len > buf.size()) return std::nullopt;
-            resp.err_msg.assign(buf.begin() + pos, buf.begin() + pos + msg_len);
-            pos += msg_len;
-            return resp;
+        if (n <= 0) {
+            return Error::system("recv");
         }
+        got += static_cast<size_t>(n);
+    }
+    return {};
+}
+
+Result<Response> RedisClient::send(std::vector<std::string> args) {
+    if (fd_ < 0) {
+        return Error{Errc::state, "not connected"};
+    }
+
+    // Frame: [u32 payload_len][u32 argc][u32 arg_len][bytes]...
+    uint32_t payload = 4;
+    for (const auto& arg : args) {
+        payload += 4 + static_cast<uint32_t>(arg.size());
+    }
+
+    std::vector<uint8_t> msg(4 + payload);
+    put_le(msg.data(), payload);
+    put_le(msg.data() + 4, static_cast<uint32_t>(args.size()));
+    size_t off = 8;
+    for (const auto& arg : args) {
+        put_le(msg.data() + off, static_cast<uint32_t>(arg.size()));
+        std::memcpy(msg.data() + off + 4, arg.data(), arg.size());
+        off += 4 + arg.size();
+    }
+
+    if (auto w = write_all(msg.data(), msg.size()); w.is_err()) {
+        return w.error();
+    }
+    return read_frame();
+}
+
+Result<Response> RedisClient::read_frame() {
+    uint8_t header[4];
+    if (auto r = read_exact(header, 4); r.is_err()) {
+        return r.error();
+    }
+    const uint32_t len = load_le<uint32_t>(header);
+    if (len > MAX_FRAME) {
+        return Error{Errc::protocol, std::format("frame of {} bytes exceeds limit", len)};
+    }
+
+    std::vector<uint8_t> body(len);
+    if (auto r = read_exact(body.data(), len); r.is_err()) {
+        return r.error();
+    }
+
+    size_t pos = 0;
+    return parse_value({reinterpret_cast<const char*>(body.data()), body.size()}, pos);
+}
+
+namespace {
+
+Result<Response> parse_value(std::string_view buf, size_t& pos) {
+    auto need = [&](size_t n) -> Result<void> {
+        if (buf.size() - pos < n) {
+            return Error{Errc::protocol, "truncated response"};
+        }
+        return {};
+    };
+
+    if (pos >= buf.size()) {
+        return Error{Errc::protocol, "empty response body"};
+    }
+
+    Response out;
+    out.tag = static_cast<ResponseTag>(buf[pos++]);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(buf.data()) + pos;
+
+    switch (out.tag) {
+        case ResponseTag::Nil:
+            return out;
+
+        case ResponseTag::Error:
+            if (auto g = need(8); g.is_err()) return g.error();
+            out.err_code = static_cast<int32_t>(load_le<uint32_t>(p));
+            pos += 4;
+            p += 4;
+            {
+                const uint32_t msg_len = load_le<uint32_t>(p);
+                pos += 4;
+                p += 4;
+                if (auto g = need(msg_len); g.is_err()) return g.error();
+                out.err_msg.assign(buf.data() + pos, msg_len);
+                pos += msg_len;
+            }
+            return out;
 
         case ResponseTag::Str: {
-            if (pos + 4 > buf.size()) return std::nullopt;
-            uint32_t slen;
-            std::memcpy(&slen, buf.data() + pos, 4);
+            if (auto g = need(4); g.is_err()) return g.error();
+            const uint32_t slen = load_le<uint32_t>(p);
             pos += 4;
-            if (pos + slen > buf.size()) return std::nullopt;
-            resp.str.assign(buf.begin() + pos, buf.begin() + pos + slen);
+            p += 4;
+            if (auto g = need(slen); g.is_err()) return g.error();
+            out.str.assign(buf.data() + pos, slen);
             pos += slen;
-            return resp;
+            return out;
         }
 
-        case ResponseTag::Int: {
-            if (pos + 8 > buf.size()) return std::nullopt;
-            std::memcpy(&resp.integer, buf.data() + pos, 8);
+        case ResponseTag::Int:
+            if (auto g = need(8); g.is_err()) return g.error();
+            out.integer = static_cast<int64_t>(load_le<uint64_t>(p));
             pos += 8;
-            return resp;
-        }
+            return out;
 
-        case ResponseTag::Dbl: {
-            if (pos + 8 > buf.size()) return std::nullopt;
-            std::memcpy(&resp.dbl, buf.data() + pos, 8);
+        case ResponseTag::Dbl:
+            if (auto g = need(8); g.is_err()) return g.error();
+            std::memcpy(&out.dbl, p, 8);
             pos += 8;
-            return resp;
-        }
+            return out;
 
         case ResponseTag::Arr: {
-            if (pos + 4 > buf.size()) return std::nullopt;
-            uint32_t count;
-            std::memcpy(&count, buf.data() + pos, 4);
+            if (auto g = need(4); g.is_err()) return g.error();
+            const uint32_t count = load_le<uint32_t>(p);
             pos += 4;
-            resp.arr.reserve(count);
+            out.arr.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
-                auto elem = read_value_from(buf, pos);
-                if (!elem) return std::nullopt;
-                resp.arr.push_back(std::move(*elem));
+                auto elem = parse_value(buf, pos);
+                if (elem.is_err()) {
+                    return elem;
+                }
+                out.arr.push_back(std::move(elem.value()));
             }
-            return resp;
+            return out;
         }
     }
-    return std::nullopt;
+    return Error{Errc::protocol, std::format("unknown tag {}", static_cast<int>(out.tag))};
 }
 
-// The public read_response needs to call the free function
-std::optional<Response> RedisClient::read_value() {
-    uint32_t len;
-    if (!read_exact(reinterpret_cast<uint8_t*>(&len), 4)) return std::nullopt;
-    std::vector<uint8_t> buf(len);
-    if (!read_exact(buf.data(), len)) return std::nullopt;
-    size_t pos = 0;
-    return read_value_from(buf, pos);
-}
+} // namespace
 
 // ── Convenience wrappers ──
 
-std::optional<Response> RedisClient::set(const std::string& key, const std::string& val) {
-    return send({"set", key, val});
+Result<Response> RedisClient::set(std::string_view key, std::string_view val) {
+    return send({std::string("set"), std::string(key), std::string(val)});
 }
 
-std::optional<Response> RedisClient::get(const std::string& key) {
-    return send({"get", key});
+Result<Response> RedisClient::get(std::string_view key) {
+    return send({std::string("get"), std::string(key)});
 }
 
-std::optional<Response> RedisClient::del(const std::string& key) {
-    return send({"del", key});
+Result<Response> RedisClient::del(std::string_view key) {
+    return send({std::string("del"), std::string(key)});
 }
 
-std::optional<Response> RedisClient::lpush(const std::string& key, const std::string& val) {
-    return send({"lpush", key, val});
+Result<Response> RedisClient::lpush(std::string_view key, std::string_view val) {
+    return send({std::string("lpush"), std::string(key), std::string(val)});
 }
 
-std::optional<Response> RedisClient::rpop(const std::string& key) {
-    return send({"rpop", key});
+Result<Response> RedisClient::rpop(std::string_view key) {
+    return send({std::string("rpop"), std::string(key)});
 }
 
-std::optional<Response> RedisClient::lrange(const std::string& key, int64_t start, int64_t stop) {
-    return send({"lrange", key, std::to_string(start), std::to_string(stop)});
+Result<Response> RedisClient::lrange(std::string_view key, int64_t start, int64_t stop) {
+    return send({std::string("lrange"), std::string(key), std::to_string(start),
+                 std::to_string(stop)});
 }
 
-std::optional<Response> RedisClient::llen(const std::string& key) {
-    return send({"llen", key});
+Result<Response> RedisClient::llen(std::string_view key) {
+    return send({std::string("llen"), std::string(key)});
 }
 
-std::optional<Response> RedisClient::job_next() {
-    return send({"job next"});
+Result<Response> RedisClient::job_next() {
+    return send({std::string("job next")});
 }
 
-std::optional<Response> RedisClient::job_status(const std::string& id) {
-    return send({"job status", id});
+Result<Response> RedisClient::job_status(std::string_view id) {
+    return send({std::string("job status"), std::string(id)});
 }
 
-std::optional<Response> RedisClient::job_result(const std::string& id, int exit_code, int64_t duration_ms) {
-    return send({"job result", id, std::to_string(exit_code), std::to_string(duration_ms)});
+Result<Response> RedisClient::job_result(std::string_view id, int exit_code,
+                                         int64_t duration_ms) {
+    return send({std::string("job result"), std::string(id), std::to_string(exit_code),
+                 std::to_string(duration_ms)});
 }
 
-std::optional<Response> RedisClient::job_log(const std::string& id, const std::string& line) {
-    return send({"job log", id, line});
+Result<Response> RedisClient::job_log(std::string_view id, std::string_view line) {
+    return send({std::string("job log"), std::string(id), std::string(line)});
 }
 
-std::optional<Response> RedisClient::sandbox_register(const std::string& id, const std::string& type, const std::string& addr) {
-    return send({"sandbox register", id, type, addr});
+Result<Response> RedisClient::sandbox_register(std::string_view id, std::string_view type,
+                                               std::string_view addr) {
+    return send({std::string("sandbox register"), std::string(id), std::string(type),
+                 std::string(addr)});
 }
 
-std::optional<Response> RedisClient::sandbox_claim(const std::string& id, const std::string& job_id) {
-    return send({"sandbox claim", id, job_id});
+Result<Response> RedisClient::sandbox_claim(std::string_view id, std::string_view job_id) {
+    return send({std::string("sandbox claim"), std::string(id), std::string(job_id)});
 }
 
-std::optional<Response> RedisClient::sandbox_release(const std::string& id) {
-    return send({"sandbox release", id});
+Result<Response> RedisClient::sandbox_release(std::string_view id) {
+    return send({std::string("sandbox release"), std::string(id)});
 }
 
-std::optional<Response> RedisClient::metric_record(const std::string& name, double value) {
-    return send({"metric record", name, std::format("{:.6}", value)});
+Result<Response> RedisClient::metric_record(std::string_view name, double value) {
+    return send(
+        {std::string("metric record"), std::string(name), std::format("{:.6}", value)});
 }
 
-std::optional<Response> RedisClient::metric_summary() {
-    return send({"metric summary"});
+Result<Response> RedisClient::metric_summary() {
+    return send({std::string("metric summary")});
 }
 
 } // namespace devops
