@@ -35,45 +35,20 @@ pub struct Server {
 }
 
 impl Server {
-    fn max_sem(cfg: &Config) -> Arc<Semaphore> {
-        let max = if cfg.max_connections == 0 {
-            1000
-        } else {
-            cfg.max_connections
-        };
-        Arc::new(Semaphore::new(max))
-    }
-
     pub fn new(cfg: Config) -> Self {
         let (store, _shutdown_tx) = Store::new_with_expiry();
-        let sem = Self::max_sem(&cfg);
+        let max = if cfg.max_connections == 0 { 1000 } else { cfg.max_connections };
         Server {
             cfg,
             store,
-            sem,
+            sem: Arc::new(Semaphore::new(max)),
             stats: Stats::new(),
-            auth: Arc::new(RwLock::new(AuthConfig::default())),
-        }
-    }
-
-    pub fn new_with_stats(cfg: Config, stats: Arc<Stats>) -> Self {
-        let (store, _shutdown_tx) = Store::new_with_expiry();
-        let sem = Self::max_sem(&cfg);
-        Server {
-            cfg,
-            store,
-            sem,
-            stats,
             auth: Arc::new(RwLock::new(AuthConfig::default())),
         }
     }
 
     pub fn store(&self) -> Store {
         self.store.clone()
-    }
-
-    pub fn stats(&self) -> Arc<Stats> {
-        self.stats.clone()
     }
 
     pub async fn listen_and_serve(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -14,8 +14,6 @@ namespace {
 
 constexpr uint32_t MAX_FRAME = 64 * 1024 * 1024;
 
-// Wire integers are little-endian u32/u64; both peers run on LE hosts and the
-// format is fixed, so plain loads are fine here.
 template <class T>
 T load_le(const uint8_t* p) {
     T v;
@@ -56,7 +54,7 @@ Result<void> RedisClient::connect(std::string_view host, uint16_t port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (::inet_pton(AF_INET, std::string(host).c_str(), &addr.sin_addr) != 1) {
-        int saved = EINVAL; // inet_pton does not set errno reliably
+        int saved = EINVAL;
         close();
         errno = saved;
         return Error::system(std::format("invalid host '{}'", host));
@@ -106,7 +104,6 @@ Result<Response> RedisClient::send(std::vector<std::string> args) {
         return Error{Errc::state, "not connected"};
     }
 
-    // Frame: [u32 payload_len][u32 argc][u32 arg_len][bytes]...
     uint32_t payload = 4;
     for (const auto& arg : args) {
         payload += 4 + static_cast<uint32_t>(arg.size());
@@ -227,8 +224,6 @@ Result<Response> parse_value(std::string_view buf, size_t& pos) {
 
 } // namespace
 
-// ── Convenience wrappers ──
-
 Result<Response> RedisClient::set(std::string_view key, std::string_view val) {
     return send({std::string("set"), std::string(key), std::string(val)});
 }
@@ -288,15 +283,6 @@ Result<Response> RedisClient::sandbox_claim(std::string_view id, std::string_vie
 
 Result<Response> RedisClient::sandbox_release(std::string_view id) {
     return send({std::string("sandbox release"), std::string(id)});
-}
-
-Result<Response> RedisClient::metric_record(std::string_view name, double value) {
-    return send(
-        {std::string("metric record"), std::string(name), std::format("{:.6}", value)});
-}
-
-Result<Response> RedisClient::metric_summary() {
-    return send({std::string("metric summary")});
 }
 
 } // namespace devops

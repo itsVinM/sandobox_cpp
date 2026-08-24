@@ -2,7 +2,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Starts the real server on a random port and returns the address.
 async fn start_server() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -61,7 +60,7 @@ impl TestClient {
         self.recv_raw().await
     }
 
-    async fn send_recv_tag(&mut self, expected_tag: u8, args: &[&str]) -> Vec<u8> {
+    async fn must_send_recv(&mut self, expected_tag: u8, args: &[&str]) -> Vec<u8> {
         let raw = self.send_recv(args).await;
         assert!(!raw.is_empty(), "expected non-empty response");
         assert_eq!(
@@ -70,10 +69,6 @@ impl TestClient {
             raw[0], expected_tag
         );
         raw
-    }
-
-    async fn must_send_recv(&mut self, expected_tag: u8, args: &[&str]) -> Vec<u8> {
-        self.send_recv_tag(expected_tag, args).await
     }
 }
 
@@ -289,4 +284,37 @@ async fn test_multiple_clients() {
     for h in handles {
         h.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_list_ops() {
+    let addr = start_server().await;
+    let mut c = TestClient::connect(&addr).await;
+
+    c.must_send_recv(3, &["lpush", "q", "a"]).await;
+    c.must_send_recv(3, &["lpush", "q", "b"]).await;
+
+    let raw = c.must_send_recv(3, &["llen", "q"]).await;
+    assert_eq!(decode_int(&raw), 2);
+
+    let raw = c.must_send_recv(2, &["lpop", "q"]).await;
+    assert_eq!(decode_str(&raw), "b");
+
+    c.must_send_recv(3, &["lpush", "q", "c"]).await;
+    let raw = c.must_send_recv(5, &["lrange", "q", "0", "-1"]).await;
+    assert_eq!(raw[0], 5);
+}
+
+#[tokio::test]
+async fn test_job_queue() {
+    let addr = start_server().await;
+    let mut c = TestClient::connect(&addr).await;
+
+    c.must_send_recv(2, &["job submit", "j1", "test", "local", "echo hi"]).await;
+    let raw = c.must_send_recv(5, &["job next"]).await;
+    assert_eq!(raw[0], 5);
+
+    c.must_send_recv(2, &["job result", "j1", "0", "100"]).await;
+    let raw = c.must_send_recv(2, &["job status", "j1"]).await;
+    assert_eq!(decode_str(&raw), "passed");
 }

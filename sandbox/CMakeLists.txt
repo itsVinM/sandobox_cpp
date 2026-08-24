@@ -9,23 +9,16 @@ add_executable(sandbox
     src/main.cpp
     src/redis_client.cpp
     src/sandbox.cpp
-    src/cgroup.cpp
     src/seccomp.cpp
     src/metrics.cpp
-    src/file_watcher.cpp
     src/health_monitor.cpp
     src/log_aggregator.cpp
-    src/netns.cpp
     src/resource_monitor.cpp
     src/process_supervisor.cpp
-    src/snapshot.cpp
-    src/ipc.cpp
-    src/security.cpp
 )
 
 target_include_directories(sandbox PRIVATE include/)
 
-# Platform-specific link libraries
 if(APPLE)
     target_link_libraries(sandbox PRIVATE pthread)
 else()

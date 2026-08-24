@@ -4,19 +4,14 @@ use std::time::{Duration, Instant};
 
 use crate::zset::ZSet;
 
-/// Number of independent lock domains. Keys hash to exactly one shard, so
-/// concurrent traffic on different keys never contends on a global lock.
 const SHARDS: usize = 32;
 
-/// Cache-line alignment keeps neighbouring shards off one core's line when
-/// different tasks hammer different keys.
 #[repr(align(64))]
 struct CacheLine<T>(T);
 
 #[derive(Clone)]
 pub enum Value {
     Str(String),
-    Bytes(Vec<u8>),
     ZSet(Arc<RwLock<ZSet>>),
     List(Arc<RwLock<VecDeque<String>>>),
 }
@@ -30,21 +25,11 @@ impl Entry {
     fn expired(&self) -> bool {
         self.exp_at.is_some_and(|t| Instant::now() >= t)
     }
-
-    /// Bytes view for bit operations (`Str` keys are read through as bytes).
-    fn as_bytes(&self) -> Option<&[u8]> {
-        match &self.typ {
-            Value::Bytes(b) => Some(b),
-            Value::Str(s) => Some(s.as_bytes()),
-            _ => None,
-        }
-    }
 }
 
 type Map = HashMap<String, Entry>;
 
 fn shard_of(key: &str) -> usize {
-    // FNV-1a — cheap, stable, good enough distribution for shard picking.
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in key.as_bytes() {
         h ^= u64::from(*b);
@@ -85,8 +70,6 @@ impl Store {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        // Sweep ONE shard per tick under its exclusive lock:
-                        // bounded stall instead of freezing every key.
                         let mut map = shards[cursor % SHARDS].0.write().unwrap();
                         let now = Instant::now();
                         map.retain(|_, e| e.exp_at.is_none_or(|t| now < t));
@@ -103,8 +86,6 @@ impl Store {
     fn shard(&self, key: &str) -> &RwLock<Map> {
         &self.shards[shard_of(key)].0
     }
-
-    // ── KV ──
 
     pub async fn len(&self) -> usize {
         let mut n = 0;
@@ -123,7 +104,6 @@ impl Store {
         match map.get(key) {
             Some(e) if !e.expired() => match &e.typ {
                 Value::Str(s) => (Some(s.clone()), false),
-                Value::Bytes(b) => (Some(String::from_utf8_lossy(b).to_string()), false),
                 _ => (None, true),
             },
             _ => (None, false),
@@ -288,30 +268,6 @@ impl Store {
         }
     }
 
-    pub async fn lpush_all(&self, key: String, vals: Vec<String>) {
-        let mut map = self.shard(&key).write().unwrap();
-        match map.get_mut(&key) {
-            Some(e) => {
-                if let Value::List(list) = &mut e.typ {
-                    let mut list = list.write().unwrap();
-                    let old = std::mem::take(&mut *list);
-                    let mut nd: VecDeque<String> = vals.into_iter().collect();
-                    nd.extend(old);
-                    *list = nd;
-                }
-            }
-            None => {
-                map.insert(
-                    key,
-                    Entry {
-                        typ: Value::List(Arc::new(RwLock::new(vals.into_iter().collect()))),
-                        exp_at: None,
-                    },
-                );
-            }
-        }
-    }
-
     pub async fn lrange(&self, key: &str, start: i64, stop: i64) -> Vec<String> {
         let map = self.shard(key).read().unwrap();
         match map.get(key) {
@@ -409,123 +365,4 @@ impl Store {
             None => 0,
         }
     }
-
-    // ── Bitfield ──
-
-    pub async fn set_bit(&self, key: &str, bit: u32, on: bool) {
-        let byte_idx = (bit / 8) as usize;
-        let mask = 1u8 << (bit % 8);
-        let mut map = self.shard(key).write().unwrap();
-        if let Some(b) = bytes_entry(&mut map, key, byte_idx + 1) {
-            set_bit_in(&mut b[byte_idx], mask, on);
-        }
-    }
-
-    pub async fn get_bit(&self, key: &str, bit: u32) -> bool {
-        let map = self.shard(key).read().unwrap();
-        match map.get(key) {
-            Some(e) if !e.expired() => e.as_bytes().is_some_and(|b| test_bit_in(b, bit)),
-            _ => false,
-        }
-    }
-
-    pub async fn bitcount(&self, key: &str) -> i64 {
-        let map = self.shard(key).read().unwrap();
-        match map.get(key) {
-            Some(e) if !e.expired() => e
-                .as_bytes()
-                .map_or(0, |b| b.iter().map(|x| x.count_ones() as i64).sum()),
-            _ => 0,
-        }
-    }
-
-    pub async fn bitfield_get(&self, key: &str, offset: u32, width: u32) -> u64 {
-        let map = self.shard(key).read().unwrap();
-        match map.get(key) {
-            Some(e) if !e.expired() => e.as_bytes().map_or(0, |b| bits_to_u64(b, offset, width)),
-            _ => 0,
-        }
-    }
-
-    pub async fn bitfield_set(&self, key: &str, offset: u32, width: u32, val: u64) {
-        if width == 0 {
-            return;
-        }
-        let last_byte = ((offset + width - 1) / 8) as usize;
-        let mut map = self.shard(key).write().unwrap();
-        if let Some(b) = bytes_entry(&mut map, key, last_byte + 1) {
-            for i in 0..width {
-                let bit = offset + i;
-                set_bit_in(
-                    &mut b[(bit / 8) as usize],
-                    1u8 << (bit % 8),
-                    (val >> i) & 1 == 1,
-                );
-            }
-        }
-    }
-}
-
-/// Returns the entry's owned byte buffer (promoting `Str` to `Bytes` or
-/// creating the entry), grown to at least `min_len`. `None` for non-bytes types.
-fn bytes_entry<'a>(map: &'a mut Map, key: &str, min_len: usize) -> Option<&'a mut Vec<u8>> {
-    if !matches!(
-        map.get(key),
-        Some(Entry {
-            typ: Value::Bytes(_),
-            ..
-        })
-    ) {
-        match map.get_mut(key) {
-            Some(e) => {
-                let Value::Str(s) = &mut e.typ else {
-                    return None;
-                };
-                e.typ = Value::Bytes(std::mem::take(s).into_bytes());
-            }
-            None => {
-                map.insert(
-                    key.to_string(),
-                    Entry {
-                        typ: Value::Bytes(Vec::new()),
-                        exp_at: None,
-                    },
-                );
-            }
-        }
-    }
-    let Entry {
-        typ: Value::Bytes(b),
-        ..
-    } = map.get_mut(key)?
-    else {
-        unreachable!("just normalized above")
-    };
-    if b.len() < min_len {
-        b.resize(min_len, 0);
-    }
-    Some(b)
-}
-
-fn set_bit_in(byte: &mut u8, mask: u8, on: bool) {
-    if on {
-        *byte |= mask;
-    } else {
-        *byte &= !mask;
-    }
-}
-
-fn test_bit_in(bytes: &[u8], bit: u32) -> bool {
-    let (byte_idx, bit_idx) = ((bit / 8) as usize, bit % 8);
-    byte_idx < bytes.len() && (bytes[byte_idx] >> bit_idx) & 1 == 1
-}
-
-fn bits_to_u64(bytes: &[u8], offset: u32, width: u32) -> u64 {
-    let mut result = 0u64;
-    for i in 0..width {
-        if test_bit_in(bytes, offset + i) {
-            result |= 1 << i;
-        }
-    }
-    result
 }

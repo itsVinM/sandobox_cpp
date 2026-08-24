@@ -65,15 +65,17 @@ async fn test_set_get() {
     let mut client = TcpStream::connect(&addr).await.unwrap();
     client.set_nodelay(true).unwrap();
 
-    // SET
-    let frame = make_frame(&["set", "k", "v"]);
-    client.write_all(&frame).await.unwrap();
+    client
+        .write_all(&make_frame(&["set", "k", "v"]))
+        .await
+        .unwrap();
     let resp = expect_response(&mut client).await;
     assert_eq!(resp[0], 0, "SET should return NIL");
 
-    // GET
-    let frame = make_frame(&["get", "k"]);
-    client.write_all(&frame).await.unwrap();
+    client
+        .write_all(&make_frame(&["get", "k"]))
+        .await
+        .unwrap();
     let resp = expect_response(&mut client).await;
     assert_eq!(resp[0], 2, "GET should return STR");
     let slen = u32::from_le_bytes(resp[1..5].try_into().unwrap()) as usize;
@@ -87,20 +89,23 @@ async fn test_del() {
     let mut client = TcpStream::connect(&addr).await.unwrap();
     client.set_nodelay(true).unwrap();
 
-    // SET
     client
         .write_all(&make_frame(&["set", "x", "1"]))
         .await
         .unwrap();
     expect_response(&mut client).await;
 
-    // DEL
-    client.write_all(&make_frame(&["del", "x"])).await.unwrap();
+    client
+        .write_all(&make_frame(&["del", "x"]))
+        .await
+        .unwrap();
     let resp = expect_response(&mut client).await;
     assert_eq!(resp[0], 3, "DEL should return INT");
 
-    // GET deleted key
-    client.write_all(&make_frame(&["get", "x"])).await.unwrap();
+    client
+        .write_all(&make_frame(&["get", "x"]))
+        .await
+        .unwrap();
     let resp = expect_response(&mut client).await;
     assert_eq!(resp[0], 0, "GET of deleted key should return NIL");
 }
@@ -111,7 +116,6 @@ async fn test_zset() {
     let mut client = TcpStream::connect(&addr).await.unwrap();
     client.set_nodelay(true).unwrap();
 
-    // ZADD
     client
         .write_all(&make_frame(&["zadd", "z", "1.5", "a"]))
         .await
@@ -119,7 +123,6 @@ async fn test_zset() {
     let resp = expect_response(&mut client).await;
     assert_eq!(resp[0], 3, "ZADD should return INT");
 
-    // ZSCORE
     client
         .write_all(&make_frame(&["zscore", "z", "a"]))
         .await
@@ -129,7 +132,6 @@ async fn test_zset() {
     let score = f64::from_le_bytes(resp[1..9].try_into().unwrap());
     assert!((score - 1.5).abs() < 1e-10);
 
-    // ZQUERY: min_score=0, min_name="", offset=0, limit=10
     client
         .write_all(&make_frame(&["zquery", "z", "0", "", "0", "10"]))
         .await
@@ -155,7 +157,10 @@ async fn test_keys() {
         .unwrap();
     expect_response(&mut client).await;
 
-    client.write_all(&make_frame(&["keys"])).await.unwrap();
+    client
+        .write_all(&make_frame(&["keys"]))
+        .await
+        .unwrap();
     let resp = expect_response(&mut client).await;
     assert_eq!(resp[0], 5, "KEYS should return ARR");
 }
@@ -166,11 +171,45 @@ async fn test_unknown_command() {
     let mut client = TcpStream::connect(&addr).await.unwrap();
     client.set_nodelay(true).unwrap();
 
-    client.write_all(&make_frame(&["bogus"])).await.unwrap();
+    client
+        .write_all(&make_frame(&["bogus"]))
+        .await
+        .unwrap();
     let resp = expect_response(&mut client).await;
     assert_eq!(resp[0], 1, "unknown command should return ERR");
-    // ERR: [tag(1)][code:4B][msg_len:4B][msg]
     let slen = u32::from_le_bytes(resp[5..9].try_into().unwrap()) as usize;
     let msg = String::from_utf8(resp[9..9 + slen].to_vec()).unwrap();
     assert!(msg.contains("unknown"), "error should mention 'unknown'");
+}
+
+#[tokio::test]
+async fn test_list_ops() {
+    let addr = spawn_server().await;
+    let mut client = TcpStream::connect(&addr).await.unwrap();
+    client.set_nodelay(true).unwrap();
+
+    client
+        .write_all(&make_frame(&["lpush", "q", "a"]))
+        .await
+        .unwrap();
+    expect_response(&mut client).await;
+    client
+        .write_all(&make_frame(&["lpush", "q", "b"]))
+        .await
+        .unwrap();
+    expect_response(&mut client).await;
+
+    client
+        .write_all(&make_frame(&["llen", "q"]))
+        .await
+        .unwrap();
+    let resp = expect_response(&mut client).await;
+    assert_eq!(resp[0], 3);
+
+    client
+        .write_all(&make_frame(&["lpop", "q"]))
+        .await
+        .unwrap();
+    let resp = expect_response(&mut client).await;
+    assert_eq!(resp[0], 2);
 }

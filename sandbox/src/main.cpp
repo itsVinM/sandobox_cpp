@@ -1,15 +1,10 @@
 #include <devops/redis_client.hpp>
 #include <devops/sandbox.hpp>
 #include <devops/metrics.hpp>
-#include <devops/file_watcher.hpp>
 #include <devops/health_monitor.hpp>
 #include <devops/log_aggregator.hpp>
 #include <devops/resource_monitor.hpp>
 #include <devops/process_supervisor.hpp>
-#include <devops/netns.hpp>
-#include <devops/snapshot.hpp>
-#include <devops/ipc.hpp>
-#include <devops/security.hpp>
 #include <charconv>
 #include <format>
 #include <iostream>
@@ -20,13 +15,6 @@
 #include <signal.h>
 #include <getopt.h>
 #include <unistd.h>
-#ifdef __APPLE__
-#include <sys/event.h>
-#define IN_CREATE 0
-#define IN_MODIFY 0
-#else
-#include <sys/inotify.h>
-#endif
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -42,19 +30,11 @@ static void print_usage(const char* prog) {
         "  -i, --id ID           Sandbox ID (default: auto)\n"
         "  -t, --type TYPE       Target type (default: local)\n"
         "  -m, --metrics-port    Prometheus port (default: 9090)\n"
-        "  -w, --watch PATH      Watch path for auto-trigger\n"
         "  -n, --no-seccomp      Disable seccomp filter\n"
-        "  --security PROFILE    Security profile (minimal/standard/relaxed/network/filesystem/untrusted)\n"
-        "  --enable-netns        Enable network namespace isolation\n"
-        "  --enable-ipc          Enable inter-sandbox IPC\n"
         "  --max-restarts N      Max restarts on failure (default: 3)\n"
-        " --help                Show this help\n",
+        "  --help                Show this help\n",
         prog);
 }
-
-// ── Configuration ──
-// Parsed into one struct up front so main() reads linearly afterwards and
-// numeric flags can never throw (from_chars instead of std::stoi).
 
 struct Options {
     std::string host = "127.0.0.1";
@@ -62,11 +42,7 @@ struct Options {
     std::string sandbox_id = "cpp-sandbox-1";
     std::string target_type = "local";
     uint16_t metrics_port = 9090;
-    std::string watch_path;
     bool use_seccomp = true;
-    std::string security_profile = "standard";
-    bool enable_netns = false;
-    bool enable_ipc = false;
     uint32_t max_restarts = 3;
     bool help = false;
 };
@@ -91,27 +67,19 @@ static devops::Result<Options> parse_args(int argc, char* argv[]) {
         {"id",            required_argument, nullptr, 'i'},
         {"type",          required_argument, nullptr, 't'},
         {"metrics-port",  required_argument, nullptr, 'm'},
-        {"watch",         required_argument, nullptr, 'w'},
         {"no-seccomp",    no_argument,       nullptr, 'n'},
-        {"security",      required_argument, nullptr, 's'},
-        {"enable-netns",  no_argument,       nullptr, 'N'},
-        {"enable-ipc",    no_argument,       nullptr, 'I'},
         {"max-restarts",  required_argument, nullptr, 'r'},
         {"help",          no_argument,       nullptr, 'H'},
         {nullptr,         0,                 nullptr, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "h:p:i:t:m:w:ns:NIr:H", long_opts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "h:p:i:t:m:nr:H", long_opts, nullptr)) != -1) {
         switch (opt) {
             case 'h': o.host = optarg; break;
             case 'i': o.sandbox_id = optarg; break;
             case 't': o.target_type = optarg; break;
-            case 'w': o.watch_path = optarg; break;
-            case 's': o.security_profile = optarg; break;
             case 'n': o.use_seccomp = false; break;
-            case 'N': o.enable_netns = true; break;
-            case 'I': o.enable_ipc = true; break;
             case 'H': o.help = true; return o;
             default:  return devops::Error{devops::Errc::config, "bad flag"};
             case 'p': {
@@ -154,11 +122,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Field order matches Options exactly — structured bindings must name
-    // every member, so `help` is bound too and consumed right below.
-    auto [host, port, sandbox_id_default, target_type, metrics_port, watch_path,
-          use_seccomp, security_profile, enable_netns, enable_ipc, max_restarts,
-          help_requested] = *parsed;
+    auto [host, port, sandbox_id_default, target_type, metrics_port,
+          use_seccomp, max_restarts, help_requested] = *parsed;
 
     if (help_requested) {
         print_usage(argv[0]);
@@ -170,28 +135,19 @@ int main(int argc, char* argv[]) {
                                  : sandbox_id_default;
 
     std::cout << std::format(
-        "[sandbox] id={} type={} host={}:{} metrics={} seccomp={} profile={} netns={} ipc={}\n",
-        sandbox_id, target_type, host, port, metrics_port, use_seccomp,
-        security_profile, enable_netns, enable_ipc);
-
-    // ── Initialize components ──
+        "[sandbox] id={} type={} host={}:{} metrics={} seccomp={}\n",
+        sandbox_id, target_type, host, port, metrics_port, use_seccomp);
 
     devops::MetricsExporter metrics;
     devops::MetricsServer metrics_server(metrics_port);
     devops::HealthMonitor health_monitor;
     devops::LogAggregator log_agg;
-    devops::FileWatcher file_watcher;
     devops::ResourceManager resource_manager;
     devops::ProcessSupervisor process_supervisor;
-    devops::SecurityManager security_manager;
-    std::shared_ptr<devops::NetworkManager> net_manager;
-    std::shared_ptr<devops::IPCManager> ipc_manager;
 
     metrics_server.set_exporter(&metrics);
 
-    // Register health checks (matching the HealthCheckFn signature: bool(std::string&))
     health_monitor.register_check("redis", [&](std::string& msg) -> bool {
-        // Health check runs periodically
         msg = "ok";
         return true;
     });
@@ -209,67 +165,13 @@ int main(int argc, char* argv[]) {
         return true;
     });
 
-    // Security manager
-    auto sec_profile = security_manager.get_profile(security_profile);
-    if (!sec_profile) {
-        std::cerr << std::format("[sandbox] unknown security profile: {}\n", security_profile);
-        return 1;
-    }
-
-    // Network namespace manager
-    if (enable_netns) {
-        devops::NetnsConfig netns_cfg;
-        netns_cfg.name = "sandbox-netns";
-        netns_cfg.bridge = "sandbox-br0";
-        netns_cfg.subnet = "10.100.0.0/24";
-        net_manager = std::make_shared<devops::NetworkManager>(netns_cfg);
-        if (!net_manager->init()) {
-            std::cerr << "[sandbox] failed to init network manager\n";
-            return 1;
-        }
-        std::cout << "[sandbox] network namespace manager ready\n";
-    }
-
-    // IPC manager
-    if (enable_ipc) {
-        devops::IPCConfig ipc_cfg;
-        ipc_cfg.sandbox_id = sandbox_id;
-        ipc_cfg.socket_path = "/tmp/sandbox-ipc";
-        ipc_manager = std::make_shared<devops::IPCManager>(ipc_cfg);
-        auto channel = ipc_manager->register_sandbox(sandbox_id);
-        if (!channel) {
-            std::cerr << "[sandbox] failed to register IPC channel\n";
-        } else {
-            channel->subscribe("command", [&](const devops::IPCMessage& msg) {
-                log_agg.push("ipc", "info",
-                    std::format("received command: {}", msg.as_string()));
-            });
-            std::cout << "[sandbox] IPC channel ready\n";
-        }
-    }
-
-    // Start metrics server
     if (metrics_server.start()) {
         std::cout << std::format("[sandbox] metrics on :{}/metrics\n", metrics_port);
     }
 
-    // Start health monitor
     health_monitor.set_interval_ms(5000);
     health_monitor.start();
 
-    // Start file watcher if path specified
-    if (!watch_path.empty()) {
-        file_watcher.watch(watch_path, IN_CREATE | IN_MODIFY);
-        file_watcher.on_change([&](const devops::FileEvent& e) {
-            log_agg.push("filewatcher", "info",
-                        std::format("file changed: {}", e.path));
-            metrics.counter("filewatcher.events_total", 1);
-        });
-        file_watcher.start();
-        std::cout << std::format("[sandbox] watching: {}\n", watch_path);
-    }
-
-    // Process supervisor event handler
     process_supervisor.on_event([&](const devops::ProcessEvent& e) {
         std::string type_str;
         switch (e.type) {
@@ -283,8 +185,6 @@ int main(int argc, char* argv[]) {
             std::format("{}: pid={} exit={}", e.process_name, e.pid, e.exit_code));
         metrics.counter("supervisor.events_total", 1, {{"type", type_str}});
     });
-
-    // ── Connect to Redis ──
 
     devops::RedisClient redis;
     if (auto conn = redis.connect(host, port); conn.is_err()) {
@@ -301,8 +201,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::cout << "[sandbox] registered\n";
-
-    // ── Main loop ──
 
     std::cout << "[sandbox] polling for jobs...\n";
     uint64_t jobs_completed = 0;
@@ -337,32 +235,10 @@ int main(int argc, char* argv[]) {
 
         (void)redis.sandbox_claim(sandbox_id, job_id);
 
-        // Validate command against security profile
-        auto validation = security_manager.validate_command(command, security_profile);
-        if (!validation.allowed) {
-            std::cerr << std::format("[sandbox] command blocked: {}\n", command);
-            for (const auto& v : validation.violations) {
-                std::cerr << std::format("  - {}\n", v);
-            }
-            (void)redis.job_log(job_id, "SECURITY: command blocked by policy");
-            (void)redis.job_result(job_id, 126, 0);
-            (void)redis.sandbox_release(sandbox_id);
-            continue;
-        }
-
-        // Create network namespace if enabled
-        std::shared_ptr<devops::NetworkNamespace> netns;
-        if (enable_netns && net_manager) {
-            netns = net_manager->create_namespace(job_id);
-            if (netns) {
-                (void)redis.job_log(job_id, "sandbox: network namespace created");
-            }
-        }
-
         devops::SandboxConfig cfg;
         cfg.id = job_id;
         cfg.enable_seccomp = use_seccomp;
-        cfg.enable_network = (target == "network" || enable_netns);
+        cfg.enable_network = (target == "network");
 
         (void)redis.job_log(job_id, "sandbox: starting execution");
 
@@ -394,11 +270,6 @@ int main(int argc, char* argv[]) {
         metrics.gauge("sandbox.jobs_completed", static_cast<double>(jobs_completed));
         metrics.gauge("sandbox.jobs_failed", static_cast<double>(jobs_failed));
 
-        // Cleanup network namespace
-        if (netns && net_manager) {
-            net_manager->remove_namespace(job_id);
-        }
-
         (void)redis.sandbox_release(sandbox_id);
 
         std::string status = (result.exit_code == 0) ? "PASSED" : "FAILED";
@@ -408,18 +279,11 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // ── Shutdown ──
-
     std::cout << "[sandbox] shutting down...\n";
-    file_watcher.stop();
     health_monitor.stop();
     metrics_server.stop();
     process_supervisor.stop_all();
     redis.close();
-
-    if (enable_netns && net_manager) {
-        // Cleanup all network namespaces
-    }
 
     std::cout << std::format("[sandbox] completed: {} jobs, {} failed\n",
                              jobs_completed, jobs_failed);
