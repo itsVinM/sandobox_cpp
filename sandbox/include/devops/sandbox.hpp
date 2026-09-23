@@ -1,7 +1,8 @@
 #pragma once
 #include <cstdint>
-#include <string>
 #include <functional>
+#include <string>
+#include <sys/types.h>
 
 namespace devops {
 
@@ -19,8 +20,8 @@ struct SandboxConfig {
 struct ExecResult {
     int exit_code;
     int64_t duration_ms;
-    std::string stdout;
-    std::string stderr;
+    std::string out;
+    std::string err;
 };
 
 class Sandbox {
@@ -33,10 +34,6 @@ public:
                    std::function<void(const std::string&)> output_fn = nullptr);
 
 private:
-    bool setup_namespaces();
-    bool setup_cgroup();
-    bool setup_mounts();
-    bool install_seccomp();
     void cleanup();
 
     SandboxConfig config_;

@@ -1,23 +1,26 @@
 #include <devops/sandbox.hpp>
-#include <format>
-#include <iostream>
-#include <cstring>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <format>
 
 #ifdef __linux__
 #include <sched.h>
-#include <sys/wait.h>
-#include <sys/mount.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <seccomp.h>
 #include <linux/seccomp.h>
 #endif
 
 namespace devops {
+
+namespace {
+constexpr size_t kStackSize = 8 * 1024;
+}
 
 Sandbox::Sandbox(SandboxConfig config) : config_(std::move(config)) {}
 
@@ -26,154 +29,150 @@ Sandbox::~Sandbox() { cleanup(); }
 void Sandbox::cleanup() {
 #ifdef __linux__
     if (cgroup_path_.size() > 1) {
-        std::string cg_path = "/sys/fs/cgroup" + cgroup_path_;
-        rmdir(cg_path.c_str());
+        rmdir(("/sys/fs/cgroup" + cgroup_path_).c_str());
     }
-    if (pipe_fd_[0] >= 0) close(pipe_fd_[0]);
-    if (pipe_fd_[1] >= 0) close(pipe_fd_[1]);
-    pipe_fd_[0] = pipe_fd_[1] = -1;
+    for (int& fd : pipe_fd_) {
+        if (fd >= 0) close(fd);
+        fd = -1;
+    }
 #endif
 }
 
 #ifdef __linux__
 
-// ── Stack allocator for clone() ──
-
-static void* alloc_stack(size_t size) {
-    void* stack = malloc(size);
-    if (!stack) return nullptr;
-    return static_cast<char*>(stack) + size;
-}
-
-// ── Data passed into the child ──
-
+// Data passed to the child; only pointers, no copies.
 struct ChildArgs {
-    SandboxConfig config;
-    std::string cgroup_path;
+    const SandboxConfig* config;
+    const std::string* command;
+    const std::string* cgroup_path;
     int pipe_fd;
 };
 
-// ── Child entry point (called in new PID namespace) ──
+static int write_file(const std::string& path, const char* fmt, auto... args) {
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) return -1;
+    int n = fprintf(f, fmt, args...);
+    fclose(f);
+    return n;
+}
 
+// Allow single rule, skipping syscalls that don't exist on the target arch
+// (e.g. arch_prctl is x86_64-only, faccessat2 is newer kernels), so the same
+// filter compiles and runs everywhere.
+static void allow_syscall(scmp_filter_ctx ctx, const char* name) {
+    int sys = seccomp_syscall_resolve_name(name);
+    if (sys != __NR_SCMP_ERROR) {
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, (int)sys, 0);
+    }
+}
+
+// Syscalls needed by the child (glibc startup + /bin/sh) before it execs a
+// command. The child runs without network; socket syscalls stay blocked.
+static void install_allowlist(scmp_filter_ctx ctx) {
+    for (const char* name : {
+            "read", "write", "close", "openat", "lseek", "poll", "ppoll",
+            "select", "pselect6", "pipe", "pipe2",
+            "mmap", "munmap", "mprotect", "mremap", "brk",
+            "execve", "exit", "exit_group",
+            "getpid", "getppid", "getuid", "geteuid", "getgid", "getegid",
+            "getrandom", "futex", "rseq", "set_robust_list", "set_tid_address",
+            "fstat", "newfstatat", "statfs", "fstatfs",
+            "faccessat", "faccessat2", "readlinkat", "getcwd", "chdir", "uname",
+            "getdents64", "ioctl", "arch_prctl", "prctl",
+            "rt_sigaction", "rt_sigprocmask", "sigaltstack",
+            "clock_gettime", "nanosleep",
+            "clone", "wait4", "waitid", "fcntl", "dup2", "dup3",
+            "prlimit64", "getrlimit", "setrlimit", "getrusage"}) {
+        allow_syscall(ctx, name);
+    }
+}
+
+// Child entry point, runs in a fresh PID namespace on its own stack.
 static int child_entry(void* arg) {
     auto* args = static_cast<ChildArgs*>(arg);
+    const SandboxConfig& cfg = *args->config;
 
-    // Setup cgroup
-    std::string cg_base = "/sys/fs/cgroup" + args->cgroup_path;
+    std::string cg_base = "/sys/fs/cgroup" + *args->cgroup_path;
     mkdir(cg_base.c_str(), 0755);
 
-    auto write_file = [](const std::string& path, const char* fmt, auto... vals) {
-        FILE* f = fopen(path.c_str(), "w");
-        if (f) { fprintf(f, fmt, vals...); fclose(f); }
-    };
-
-    write_file(cg_base + "/memory.max", "%lu", args->config.memory_limit_bytes);
-    write_file(cg_base + "/cpu.max", "%u %u", args->config.cpu_quota_us, args->config.cpu_period_us);
-    write_file(cg_base + "/pids.max", "%u", args->config.pids_limit);
+    write_file(cg_base + "/memory.max", "%llu", (unsigned long long)cfg.memory_limit_bytes);
+    write_file(cg_base + "/cpu.max", "%u %u", cfg.cpu_quota_us, cfg.cpu_period_us);
+    write_file(cg_base + "/pids.max", "%u", cfg.pids_limit);
     write_file(cg_base + "/cgroup.procs", "%d", getpid());
 
-    // Install seccomp filter
-    if (args->config.enable_seccomp) {
+    if (cfg.enable_seccomp) {
         scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL);
         if (ctx) {
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clock_gettime), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigaction), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigprocmask), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clone), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(execve), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(wait4), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(dup2), 0);
-            seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fcntl), 0);
+            install_allowlist(ctx);
             seccomp_load(ctx);
             seccomp_release(ctx);
         }
     }
 
-    // Redirect stdout/stderr to pipe
     dup2(args->pipe_fd, STDOUT_FILENO);
     dup2(args->pipe_fd, STDERR_FILENO);
     close(args->pipe_fd);
 
-    // Exec
-    execl("/bin/sh", "sh", "-c", args->config.rootfs.c_str(), nullptr);
+    execl("/bin/sh", "sh", "-c", args->command->c_str(), nullptr);
     _exit(127);
-}
-
-bool Sandbox::setup_cgroup() {
-    cgroup_path_ = "/devops-" + config_.id;
-    return true;
 }
 
 ExecResult Sandbox::run(const std::string& command, const std::vector<std::string>&,
                         std::function<void(const std::string&)> output_fn) {
     ExecResult result{};
 
-    auto start = std::chrono::steady_clock::now();
-
-    setup_cgroup();
+    cgroup_path_ = "/devops-" + config_.id;
 
     if (pipe(pipe_fd_) != 0) {
         result.exit_code = -1;
-        result.stderr = "pipe() failed";
+        result.err = "pipe() failed";
         return result;
     }
 
-    // Build child args — must outlive the clone call
-    ChildArgs child_args;
-    child_args.config = config_;
-    child_args.config.rootfs = command;  // command becomes the shell -c arg
-    child_args.cgroup_path = cgroup_path_;
-    child_args.pipe_fd = pipe_fd_[1];
+    ChildArgs child_args{&config_, &command, &cgroup_path_, pipe_fd_[1]};
 
-    // Clone into new PID namespace
     unsigned long flags = CLONE_NEWPID | SIGCHLD;
-    if (!config_.enable_network) {
-        flags |= CLONE_NEWNET;
-    }
+    if (!config_.enable_network) flags |= CLONE_NEWNET;
 
-    void* stack = alloc_stack(4096);
-    child_pid_ = clone(child_entry, stack, flags, &child_args);
-
-    if (child_pid_ < 0) {
+    auto* stack = static_cast<char*>(malloc(kStackSize));
+    if (!stack) {
         result.exit_code = -1;
-        result.stderr = std::format("clone() failed: {}", strerror(errno));
-        free(static_cast<char*>(stack) - 4096);
+        result.err = "failed to allocate child stack";
         cleanup();
         return result;
     }
 
-    // Free the stack (child has its own copy)
-    free(static_cast<char*>(stack) - 4096);
+    auto start = std::chrono::steady_clock::now();
+    child_pid_ = clone(child_entry, stack + kStackSize, flags, &child_args);
 
-    // Close write end in parent
+    if (child_pid_ < 0) {
+        result.exit_code = -1;
+        result.err = std::format("clone() failed: {}", strerror(errno));
+        free(stack);
+        cleanup();
+        return result;
+    }
+
     close(pipe_fd_[1]);
     pipe_fd_[1] = -1;
 
-    // Read output from child
     char buf[4096];
     ssize_t n;
     while ((n = read(pipe_fd_[0], buf, sizeof(buf) - 1)) > 0) {
         buf[n] = '\0';
-        std::string line(buf, n);
-        if (output_fn) output_fn(line);
-        result.stdout += line;
+        std::string chunk(buf, n);
+        if (output_fn) output_fn(chunk);
+        result.out += chunk;
     }
 
-    // Wait for child
-    int status;
+    int status = 0;
     waitpid(child_pid_, &status, 0);
 
     auto end = std::chrono::steady_clock::now();
     result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    // The child has exited; its stack is no longer in use.
+    free(stack);
 
     if (WIFEXITED(status)) {
         result.exit_code = WEXITSTATUS(status);
@@ -194,7 +193,7 @@ ExecResult Sandbox::run(const std::string&, const std::vector<std::string>&,
                         std::function<void(const std::string&)> output_fn) {
     ExecResult result{};
     result.exit_code = -1;
-    result.stderr = "sandbox only supported on Linux (use Docker or VM for macOS)";
+    result.err = "sandbox only supported on Linux (use Docker or VM for macOS)";
     return result;
 }
 
